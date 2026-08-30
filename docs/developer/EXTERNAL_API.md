@@ -308,9 +308,16 @@ The wire format is the standard Kubernetes envelope:
 | `spec.blocks`              | yes      | Array of content blocks. The full schema is owned by the CUE definition in [grafana-pathfinder-backend/kinds/interactiveguide.cue](https://github.com/grafana/grafana-pathfinder-backend/blob/main/kinds/interactiveguide.cue) — that file is the source of truth. |
 | `spec.manifest`            | no       | Package metadata: grouping, sequencing, dependencies. Absent for content-only guides. See [Manifest](#manifest).                                                                                                                                                   |
 
-The CRD schema **is the validator**. Submit unknown fields and you'll
-get a `422 Unprocessable Entity` with a K8s `Status` envelope explaining
-which field is wrong.
+The CRD validates declared fields. A required declared field that is missing,
+or a declared value with an invalid type or value, returns a
+`422 Unprocessable Entity` with a K8s `Status` envelope.
+
+Unknown fields are **not rejected by default**. Kubernetes prunes them and
+may still return `200 OK` or `201 Created`. The API can emit a `Warning`
+response header, but callers that do not inspect headers receive no signal;
+`getBackendSrv()` does not surface it. For manifest extensions,
+`spec.manifest.additionalFields` is the only durable home for keys the CRD
+does not declare.
 
 ### Manifest
 
@@ -326,7 +333,7 @@ and what makes a path a path.
 | `author`           | no       | `{ name?, team? }`. The CRD declares no other keys; `upsert-learning-path.sh` moves any it finds (`email`, `github`, …) to `additionalFields.author` instead of dropping them. |
 | `category`         | no       | Free-form grouping label.                                                                                                                                                      |
 | `depends`          | no       | CNF (AND of ORs): an **array of arrays**. A single dependency is a singleton clause — `[["a"], ["b"]]` is "a AND b", `[["a","b"]]` is "a OR b". A bare string is not accepted. |
-| `additionalFields` | no       | Free-form escape hatch, `x-kubernetes-preserve-unknown-fields`. Anything not typed above goes here.                                                                            |
+| `additionalFields` | no       | Free-form escape hatch, `x-kubernetes-preserve-unknown-fields`. This is the only durable home for manifest keys not declared above.                                            |
 
 `recommends`, `suggests`, `provides`, `targeting`, `testEnvironment`,
 `startingLocation`, and the generated `stats` stamp have no typed home yet, so
@@ -532,14 +539,14 @@ The aggregator returns standard Kubernetes `Status` envelopes:
 
 Common cases:
 
-| HTTP | Reason        | When                                                                         |
-| ---- | ------------- | ---------------------------------------------------------------------------- |
-| 401  | -             | Missing or invalid Bearer token.                                             |
-| 403  | -             | Token's role is too low for the operation (need Editor for writes).          |
-| 404  | NotFound      | The named guide doesn't exist (or, on listing, the namespace doesn't exist). |
-| 409  | AlreadyExists | POST against a name that already exists. Use PUT to update.                  |
-| 409  | Conflict      | Stale `resourceVersion` on PUT. Re-GET and retry.                            |
-| 422  | Invalid       | Spec failed CRD validation — message names the offending field.              |
+| HTTP | Reason        | When                                                                                             |
+| ---- | ------------- | ------------------------------------------------------------------------------------------------ |
+| 401  | -             | Missing or invalid Bearer token.                                                                 |
+| 403  | -             | Token's role is too low for the operation (need Editor for writes).                              |
+| 404  | NotFound      | The named guide doesn't exist (or, on listing, the namespace doesn't exist).                     |
+| 409  | AlreadyExists | POST against a name that already exists. Use PUT to update.                                      |
+| 409  | Conflict      | Stale `resourceVersion` on PUT. Re-GET and retry.                                                |
+| 422  | Invalid       | A required declared field is missing, or a declared value is invalid; the message identifies it. |
 
 ## Choosing this vs. the editor
 
