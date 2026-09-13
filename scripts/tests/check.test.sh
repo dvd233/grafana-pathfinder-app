@@ -2,9 +2,7 @@
 # Behavioural tests for scripts/check.js — the pre-merge gate runner — run by
 # `npm run test:scripts`.
 #
-# npm is replaced by a stub on PATH, so the runner is exercised end to end
-# without spending minutes on the real gate: the stub records every step it is
-# asked to run and can be told to fail on one of them.
+# Stub npm's JavaScript entry point so this never re-enters the real gate.
 
 set -uo pipefail
 
@@ -17,25 +15,17 @@ FAIL=0
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-BIN="${WORK}/bin"
-mkdir -p "$BIN"
-cat >"${BIN}/npm" <<'STUB'
-#!/usr/bin/env bash
-# Stands in for npm. Logs "<script>" per invocation and fails on STUB_FAIL_ON.
-printf '%s\n' "$2" >>"${STUB_LOG:-/dev/null}"
-[[ "$2" == "${STUB_FAIL_ON:-}" ]] && exit 3
-exit 0
-STUB
-chmod +x "${BIN}/npm"
-export PATH="${BIN}:${PATH}"
+NODE=$(command -v node)
+EMPTY_PATH="${WORK}/empty-path"
+NPM_STUB="${WORK}/npm-stub.js"
+mkdir -p "$EMPTY_PATH"
+cat >"$NPM_STUB" <<'STUB'
+const fs = require('fs');
 
-# Without the stub, a run would reach the real npm and re-enter this suite
-# through the gate's own test:scripts step, with no depth bound.
-RESOLVED_NPM=$(command -v npm)
-if [[ "$RESOLVED_NPM" != "${BIN}/npm" ]]; then
-  printf 'check.test.sh: npm stub is not on PATH (resolved %s); refusing to run the real gate\n' "${RESOLVED_NPM:-nothing}" >&2
-  exit 1
-fi
+const step = process.argv[3];
+fs.appendFileSync(process.env.STUB_LOG, `${step}\n`);
+process.exit(step === process.env.STUB_FAIL_ON ? 3 : 0);
+STUB
 
 ok() {
   PASS=$((PASS + 1))
@@ -52,7 +42,14 @@ nope() {
 run() {
   local log="${WORK}/steps.log"
   : >"$log"
-  RUN_OUT=$(STUB_LOG="$log" STUB_FAIL_ON="${FAIL_ON:-}" node "$CHECK" "$@" 2>&1)
+  # Require the lifecycle-provided npm entry point instead of PATH fallback.
+  RUN_OUT=$(
+    PATH="$EMPTY_PATH" \
+      npm_execpath="$NPM_STUB" \
+      STUB_LOG="$log" \
+      STUB_FAIL_ON="${FAIL_ON:-}" \
+      "$NODE" "$CHECK" "$@" 2>&1
+  )
   RUN_CODE=$?
   RUN_LOG=$(cat "$log")
 }
