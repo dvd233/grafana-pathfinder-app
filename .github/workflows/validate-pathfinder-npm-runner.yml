@@ -1,0 +1,190 @@
+name: Validate isolated Pathfinder npm runner
+
+on:
+  push:
+    branches:
+      - codex/validate-pathfinder-npm-runner-20261016
+
+permissions:
+  contents: read
+
+jobs:
+  focused-linux:
+    if: >-
+      github.repository == 'dvd233/grafana-pathfinder-app' &&
+      github.repository_id == '1349470988' &&
+      github.repository_owner_id == '111864431' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/codex/validate-pathfinder-npm-runner-20261016'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact PR source and its parent
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: dvd233/grafana-pathfinder-app
+          ref: f420cecbdcdaf63a32fca4965f75990c16480e9c
+          path: source
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Use Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24.20.0'
+      - name: Verify source binding and run original focused suites
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import tempfile
+
+          HEAD = 'f420cecbdcdaf63a32fca4965f75990c16480e9c'
+          BASE = 'd5d6ab7561b1039ac791fc734763af924648cb97'
+          FILES = ['scripts/check.js', 'scripts/tests/check.test.sh', 'package.json']
+          EXPECTED = {
+              HEAD: [
+                  'e8956ba8a1a5f25a0d38df59a3e6fe075b179071',
+                  '94051c3426fa4eb5fbedbafac0ef027793f653ad',
+                  '771d6de7a7cbed701adedd6ec6c6bde9134b87a9',
+              ],
+              BASE: [
+                  '37afc3560f5263e7f1045428288198b5cd049770',
+                  'c065c78f8fea71e68809b23d4d9db6027c9e88f1',
+                  '771d6de7a7cbed701adedd6ec6c6bde9134b87a9',
+              ],
+          }
+          source = Path('source').resolve()
+          results = Path('results').resolve()
+          results.mkdir()
+          summary = {
+              'sourceCommit': HEAD,
+              'parentCommit': BASE,
+              'workflowCommit': os.environ['GITHUB_SHA'],
+              'runId': os.environ['GITHUB_RUN_ID'],
+              'runAttempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'scope': 'Focused runner only; no project dependency install or full project gate',
+              'startedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'sourceFiles': [],
+              'runs': [],
+              'passed': False,
+          }
+
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+
+          def git(*args):
+              return subprocess.check_output(['git', '-C', str(source), *args])
+
+          def blob(content):
+              return hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+
+          try:
+              require(os.environ['GITHUB_REPOSITORY'] == 'dvd233/grafana-pathfinder-app', 'Wrong fork')
+              require(os.environ['GITHUB_REPOSITORY_ID'] == '1349470988', 'Wrong repository ID')
+              require(os.environ['GITHUB_REPOSITORY_OWNER_ID'] == '111864431', 'Wrong owner ID')
+              require(os.environ['GITHUB_EVENT_NAME'] == 'push', 'Unexpected event')
+              require(os.environ['GITHUB_REF'] == 'refs/heads/codex/validate-pathfinder-npm-runner-20261016', 'Wrong validation branch')
+              require(git('rev-parse', 'HEAD').decode().strip() == HEAD, 'Source head moved')
+              require(git('rev-parse', 'HEAD^').decode().strip() == BASE, 'Unexpected source parent')
+              require(not git('status', '--porcelain', '--untracked-files=no').strip(), 'Source checkout is dirty')
+              payloads = {}
+              for ref, hashes in EXPECTED.items():
+                  payloads[ref] = {}
+                  for path, expected in zip(FILES, hashes):
+                      content = git('show', f'{ref}:{path}')
+                      require(blob(content) == expected, f'Unexpected source blob: {ref}:{path}')
+                      if ref == HEAD:
+                          require((source / path).read_bytes() == content, f'Checkout differs: {path}')
+                      payloads[ref][path] = content
+                      summary['sourceFiles'].append({
+                          'commit': ref, 'path': path, 'gitBlob': expected,
+                          'sha256': hashlib.sha256(content).hexdigest(), 'bytes': len(content),
+                      })
+              node = shutil.which('node')
+              bash = shutil.which('bash')
+              require(node is not None and bash is not None, 'Node or Bash is missing')
+              runtime = json.loads(subprocess.check_output([
+                  node, '-p', 'JSON.stringify({version:process.version,platform:process.platform,arch:process.arch})'
+              ], text=True))
+              summary['runtime'] = runtime
+              summary['bash'] = subprocess.check_output([bash, '--version'], text=True).splitlines()[0]
+              require(runtime['platform'] == 'linux', 'This validation must run on genuine Linux')
+              require(runtime['version'] == 'v24.20.0', 'Unexpected Node version')
+              fallback = '  ok   direct Node invocation retains the PATH-based npm fallback'
+              with tempfile.TemporaryDirectory(prefix='pathfinder-npm-runner-', dir=os.environ['RUNNER_TEMP']) as temp:
+                  work = Path(temp)
+                  for name in ['home', 'tmp']:
+                      (work / name).mkdir()
+                  child_env = {
+                      'PATH': os.environ['PATH'], 'HOME': str(work / 'home'),
+                      'TMPDIR': str(work / 'tmp'), 'TMP': str(work / 'tmp'), 'TEMP': str(work / 'tmp'),
+                      'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'TZ': 'UTC',
+                  }
+                  phases = [
+                      ('baseline', BASE, BASE, BASE, 0, (22, 0)),
+                      ('red', BASE, HEAD, HEAD, 1, (8, 15)),
+                      ('green', HEAD, HEAD, HEAD, 0, (23, 0)),
+                  ]
+                  for name, production_ref, test_ref, package_ref, expected_exit, expected_counts in phases:
+                      case = work / name
+                      refs = [production_ref, test_ref, package_ref]
+                      for path, ref in zip(FILES, refs):
+                          target = case / path
+                          target.parent.mkdir(parents=True, exist_ok=True)
+                          target.write_bytes(payloads[ref][path])
+                      proc = subprocess.run(
+                          [bash, '--noprofile', '--norc', 'scripts/tests/check.test.sh'],
+                          cwd=case, env=child_env, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, timeout=60,
+                      )
+                      output = proc.stdout.decode('utf-8', errors='replace')
+                      (results / f'{name}.log').write_text(output, encoding='utf-8')
+                      print(f'=== {name}: exit {proc.returncode} ===\n{output}')
+                      counts = re.findall(r'^\s*(\d+) passed, (\d+) failed\s*$', output, flags=re.MULTILINE)
+                      actual_counts = tuple(map(int, counts[0])) if len(counts) == 1 else None
+                      record = {
+                          'phase': name, 'productionCommit': production_ref, 'testCommit': test_ref,
+                          'packageCommit': package_ref, 'exitCode': proc.returncode,
+                          'counts': actual_counts, 'expectedExitCode': expected_exit,
+                          'expectedCounts': expected_counts, 'fallbackExecuted': fallback in output,
+                          'posixSkipped': bool(re.search(r'^\s*skip\b', output, flags=re.MULTILINE)),
+                      }
+                      summary['runs'].append(record)
+                      require(proc.returncode == expected_exit, f'{name}: unexpected exit code')
+                      require(actual_counts == expected_counts, f'{name}: unexpected pass/fail counts')
+                      require(not record['posixSkipped'], f'{name}: POSIX test was skipped')
+                      if name != 'baseline':
+                          require(record['fallbackExecuted'], f'{name}: PATH fallback was not exercised successfully')
+                      if name == 'red':
+                          require('spawnSync npm ENOENT' in output, 'Red control did not reproduce the expected launch failure')
+                  require(not any((work / 'tmp').iterdir()), 'Test temporary files remained')
+              require(not git('status', '--porcelain', '--untracked-files=no').strip(), 'Validation changed source checkout')
+              for path in FILES:
+                  require((source / path).read_bytes() == payloads[HEAD][path], f'Source changed: {path}')
+              summary['sourceUnchanged'] = True
+              summary['passed'] = True
+          except Exception as error:
+              summary['error'] = f'{type(error).__name__}: {error}'
+              raise
+          finally:
+              summary['finishedAt'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+              (results / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
+          PY
+      - name: Preserve focused validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pathfinder-npm-runner-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/
+          if-no-files-found: error
+          retention-days: 14
+
